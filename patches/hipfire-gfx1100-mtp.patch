@@ -1,0 +1,286 @@
+diff --git a/crates/hipfire-arch-qwen35/src/mtp_spec.rs b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
+index f27db38..c6b0235 100644
+--- a/crates/hipfire-arch-qwen35/src/mtp_spec.rs
++++ b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
+@@ -1,3 +1,4 @@
++// Modified for the gfx1100 native MTP release.
+ //! MTP-only speculative decode: standalone trunk + native MTP head loop.
+ //!
+ //! The MTP head ([`crate::mtp_head`], Task 9) is a single transformer-decoder
+@@ -2814,24 +2815,39 @@ fn mtp_shared_verify_accept_rollback_inner(
+         } else {
+             None
+         };
+-        qwen35::forward_prefill_batch_with_pbs_opts(
+-            gpu,
+-            trunk_weights,
+-            config,
+-            &verify_tokens,
+-            cur_pos,
+-            kv_cache,
+-            dn_state,
+-            scratch,
+-            None,
+-            Some(&state.verify_hidden),
+-            verify_tape,
+-            Some(&state.trunk_pbs),
+-            None,
+-            None,
+-            false,
+-            qwen35::DflashFusionCtx::Off,
+-        )
++        use hipfire_dispatch::pipeline::batched_deltanet::with_native_mtp_gdn_capture;
++        static NATIVE_CAPTURE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
++            std::env::var("HIPFIRE_EXPERIMENT_NATIVE_MTP_GDN_CAPTURE").as_deref() == Ok("1")
++        });
++        let native_capture = use_sampling
++            && !is_external
++            && config.num_experts == 0
++            && kv_cache.quant_q8
++            && kv_cache.v_mode_bits() == 8
++            && !kv_cache.quant_fp8
++            && !kv_cache.uses_vmm_backend()
++            && !gpu.fp8_verify_scope
++            && *NATIVE_CAPTURE;
++        with_native_mtp_gdn_capture(native_capture, || {
++            qwen35::forward_prefill_batch_with_pbs_opts(
++                gpu,
++                trunk_weights,
++                config,
++                &verify_tokens,
++                cur_pos,
++                kv_cache,
++                dn_state,
++                scratch,
++                None,
++                Some(&state.verify_hidden),
++                verify_tape,
++                Some(&state.trunk_pbs),
++                None,
++                None,
++                false,
++                qwen35::DflashFusionCtx::Off,
++            )
++        })
+     };
+     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+     let head = fwd.and_then(|()| {
+@@ -5579,30 +5595,25 @@ pub fn mtp_draft_phase_inner(
+                 }
+                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+             } else {
+-                if k == 0 {
+-                    mtp_head::mtp_head_forward_compressed(
+-                        gpu,
+-                        head,
+-                        &state.mtp_scratch,
+-                        &mut state.mtp_kv,
+-                        next_tok,
+-                        &state.prev_hidden,
+-                        cur_pos + k,
+-                        trunk_weights,
+-                    )?;
+-                } else {
+-                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
++                rdna_compute::attention::with_compressed_draft_gqa(|| {
++                    let prev_row;
++                    let prev = if k == 0 {
++                        &state.prev_hidden
++                    } else {
++                        prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
++                        &prev_row
++                    };
+                     mtp_head::mtp_head_forward_compressed(
+                         gpu,
+                         head,
+                         &state.mtp_scratch,
+                         &mut state.mtp_kv,
+                         next_tok,
+-                        &prev_row,
++                        prev,
+                         cur_pos + k,
+                         trunk_weights,
+-                    )?;
+-                }
++                    )
++                })?;
+             }
+
+             // Pick the logits buffer to argmax over (mode-dependent).
+diff --git a/crates/hipfire-daemon/src/gpu_lock.rs b/crates/hipfire-daemon/src/gpu_lock.rs
+index 7ffe42b..f68a712 100644
+--- a/crates/hipfire-daemon/src/gpu_lock.rs
++++ b/crates/hipfire-daemon/src/gpu_lock.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // Copyright (c) 2026 Kaden Schutt
+ // hipfire — see LICENSE and NOTICE in the project root.
++// Modified for the gfx1100 native MTP release.
+
+ //! Machine-wide per-GPU reservations.
+ //!
+@@ -391,7 +392,11 @@ impl GpuLocks {
+             .map(|(identity, _)| identity.as_str())
+             .collect::<Vec<_>>();
+         identities.sort_unstable();
+-        let hipfire_dir = Path::new(&os::home()?).join(".hipfire");
++        let hipfire_dir = if std::env::var_os("HIPFIRE_HOME").is_some() {
++            hipfire_config::hipfire_home().map_err(|e| e.to_string())?
++        } else {
++            Path::new(&os::home()?).join(".hipfire")
++        };
+         std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
+         let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
+         std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+diff --git a/crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs b/crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs
+index 5e2d7a0..7073141 100644
+--- a/crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs
++++ b/crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2026 Kaden Schutt
+ // Copyright (c) 2026 Björn Bösel
+ // hipfire — see LICENSE and NOTICE in the project root.
++// Modified for the gfx1100 native MTP release.
+
+ //! Batched (prefill / multi-row verify) gated DeltaNet linear attention:
+ //! qkv/z/beta/alpha projection, causal conv + gates, the gated delta
+@@ -103,6 +104,26 @@ pub struct GdnTapeView<'a> {
+     pub beta_bufs: &'a [GpuTensor],
+ }
+
++thread_local! {
++    static NATIVE_MTP_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Scope the fused preamble to the direct native MTP verifier.
++pub fn with_native_mtp_gdn_capture<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
++    if !enabled {
++        return run();
++    }
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            NATIVE_MTP_CAPTURE.set(self.0);
++        }
++    }
++    let _restore = Restore(NATIVE_MTP_CAPTURE.replace(true));
++    run()
++}
++
++
+ fn a8_gdn_admitted(
+     gpu: &Gpu,
+     wo: &WeightRef<'_>,
+@@ -1353,20 +1374,35 @@ pub fn batch_chunk_delta_net_pre_gdn(
+     fusion: DflashFusionCtx,
+     tape_sink: Option<&mut Vec<rdna_compute::tape_copy::TapeCopy>>,
+ ) -> HipResult<()> {
+-    let _ = fusion;
+     // S5-gdn-pre-tape-fusion fast path: one launch for sigmoid(alpha/beta) +
+     // tape writes + conv + QK norm/interleave. Chain verify is sequential
+     // so success returns early. Every failed predicate
+     // (non-sequential batch, non-GQA route, tape absence or
+     // overflow, ineligible shapes/arch) runs the pre-change sequence below
+     // launch-for-launch.
+-    if fusion.is_chain_verify()
++    let native_eligible = NATIVE_MTP_CAPTURE.get()
++        && gpu.arch == "gfx1100"
++        && gpu.active_stream.is_some()
++        && !gpu.graphs.capture_mode
++        && !gpu.replay.is_recording()
++        && matches!(fusion, DflashFusionCtx::Off)
++        && tape_sink.is_none()
++        && config.conv_kernel == 4
++        && config.linear_key_heads == 16
++        && n_v_heads == 48
++        && hd == 128
++        && k_dim == 2048
++        && v_dim == 6144
++        && dn_state.stream.lanes == 1
++        && n == 4
++        && tape_offset == 0;
++    if (fusion.is_chain_verify() || native_eligible)
+         && matches!(batch_semantics, BatchSemantics::Sequential)
+         && config.linear_key_heads < n_v_heads
+         && (1..=16).contains(&n)
+     {
+         if let Some(tape) = gdn_tape.as_ref() {
+-            if tape_offset + n <= tape.max_n {
++            if tape_offset.checked_add(n).is_some_and(|end| end <= tape.max_n) {
+                 let fused = gpu.dflash_gdn_pre_capture_gfx1100(
+                     &pbs.dn_beta_batch,
+                     &pbs.dn_alpha_batch,
+diff --git a/crates/rdna-compute/src/attention.rs b/crates/rdna-compute/src/attention.rs
+index a63fb55..9c302ce 100644
+--- a/crates/rdna-compute/src/attention.rs
++++ b/crates/rdna-compute/src/attention.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // Copyright (c) 2026 Kaden Schutt
+ // hipfire — see LICENSE and NOTICE in the project root.
++// Modified for the gfx1100 native MTP release.
+
+ //! Attention, KV cache, DFlash, and vision attention dispatch.
+
+@@ -16,6 +17,26 @@ use std::ffi::c_void;
+ #[path = "rows_batched.rs"]
+ pub mod rows_batched;
+
++thread_local! {
++    static DRAFT_GQA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Scope the opt-in grouped Q8 producer to the compressed serial draft forward.
++pub fn with_compressed_draft_gqa<T>(run: impl FnOnce() -> T) -> T {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ENABLED.get_or_init(|| std::env::var("HIPFIRE_EXPERIMENT_DRAFT_GQA").as_deref() == Ok("1")) {
++        return run();
++    }
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            DRAFT_GQA.set(self.0);
++        }
++    }
++    let _restore = Restore(DRAFT_GQA.replace(true));
++    run()
++}
++
+ /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
+ /// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
+ const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
+@@ -12337,7 +12358,21 @@ impl Gpu {
+         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
+             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
+                 == Ok("1");
+-        let (tile_module, tile_src, tile_fn) = if let Some(func) = gemma_gqa {
++        let draft_gqa = DRAFT_GQA.get()
++            && !gemma_tiles
++            && output_gate.is_none()
++            && output_awq_scale.is_none()
++            && (n_heads, n_kv_heads) == (24, 4)
++            && q8_decode_attn_gqa_gfx1100_admitted(
++                self, n_heads, n_kv_heads, head_dim, tile_size, max_tiles, window,
++            );
++        let (tile_module, tile_src, tile_fn) = if draft_gqa {
++            (
++                "attention_flash_q8_0_tile_gqa_gfx1100",
++                kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
++                "attention_flash_q8_0_tile_gqa_gfx1100",
++            )
++        } else if let Some(func) = gemma_gqa {
+             (
+                 "attention_flash_q8_0_tile_gqa_gemma_gfx1151",
+                 kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC,
+@@ -12387,7 +12422,10 @@ impl Gpu {
+             let es = effective_seq_arg;
+             // The GQA route runs one 256-thread workgroup per (kv head,
+             // tile) and loops over tiles, so its grid is capped.
+-            let (grid, block, shared) = if gemma_gqa.is_some() {
++            let (grid, block, shared) = if draft_gqa {
++                let y = launch_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP) as u32;
++                ([n_kv_heads as u32, y, 1], [256, 1, 1], 0)
++            } else if gemma_gqa.is_some() {
+                 let y = launch_tiles.min(Q8_DECODE_GQA_GEMMA_GRID_Y_CAP) as u32;
+                 ([n_kv_heads as u32, y, 1], [256, 1, 1], 0)
+             } else {

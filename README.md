@@ -79,4 +79,4 @@ Codex and ChatGPT helped with research, benchmark setup, review, and writing thi
 - [measure.py](measure.py) measures one streamed localhost request using the same timing boundaries.
 - [make_fixture.py](make_fixture.py) creates a shareable synthetic coding request with the same sampling parameters. Vary the block count and use returned usage to confirm the actual populated depth. This fixture has a different token distribution and acceptance behavior from the measured request.
 
-The experimental source changes are described above. This report does not ship a standalone buildable patch yet.
+The [Windows build guide](BUILD.md) covers the [source patch](patches/hipfire-gfx1100-mtp.patch), dependencies, configuration, launch, and rollback. The benchmark results above were recorded on the research build. See the [upstream license terms](LICENSE) and [NOTICE](NOTICE) for attribution.
